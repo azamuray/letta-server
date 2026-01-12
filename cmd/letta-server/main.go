@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -75,6 +76,23 @@ func getClientIP(r *http.Request) string {
 	return host
 }
 
+func shouldUseServerIP(clientIP string) bool {
+	ip := net.ParseIP(clientIP)
+	if ip == nil {
+		return false
+	}
+
+	// Проверяем WireGuard диапазон (10.7.0.0/24)
+	if strings.HasPrefix(clientIP, "10.7.") {
+		return true
+	}
+
+	// Проверяем общие приватные сети
+	return ip.IsPrivate() ||
+		ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast()
+}
+
 // ipHandler возвращает публичный IP клиента
 func ipHandler(w http.ResponseWriter, r *http.Request) {
 	clientIP := getClientIP(r)
@@ -84,7 +102,14 @@ func ipHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	country, err := getCountryByIP(clientIP)
+	var displayIP string
+	if shouldUseServerIP(clientIP) {
+		displayIP = serverPublicIP
+	} else {
+		displayIP = clientIP
+	}
+
+	country, err := getCountryByIP(displayIP)
 
 	if err != nil {
 		http.Error(w, "Не удалось определить страну", http.StatusInternalServerError)
@@ -92,7 +117,7 @@ func ipHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := IPResponse{
-		IP:      clientIP,
+		IP:      displayIP,
 		Country: country,
 	}
 
@@ -101,7 +126,27 @@ func ipHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+func getServerPublicIP() (string, error) {
+	// Один раз при старте получаем IP сервера
+	resp, err := http.Get("https://api.ipify.org")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	return string(body), err
+}
+
+var serverPublicIP string
+
 func main() {
+
+	ip, err := getServerPublicIP()
+	if err == nil {
+		serverPublicIP = ip
+	}
+
 	port := ":8080"
 
 	http.HandleFunc("/ip", ipHandler)
