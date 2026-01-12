@@ -10,7 +10,34 @@ import (
 
 // IPResponse ответ с IP адресом клиента
 type IPResponse struct {
-	IP string `json:"ip"`
+	IP      string `json:"ip"`
+	Country string `json:"country"`
+}
+
+type IPInfo struct {
+	Country     string `json:"country"`
+	CountryCode string `json:"countryCode"`
+}
+
+func getCountryByIP(ip string) (string, error) {
+	// метод из сервиса, котрый по ip возвращает страну
+	// Лишь 45 запросов в минуту для бесплатной версии
+	url := "http://ip-api.com/json/" + ip
+
+	resp, err := http.Get(url)
+
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var info IPInfo
+
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return "", err
+	}
+
+	return info.Country, nil
 }
 
 // getClientIP извлекает реальный IP адрес клиента из запроса
@@ -57,8 +84,16 @@ func ipHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	country, err := getCountryByIP(clientIP)
+
+	if err != nil {
+		http.Error(w, "Не удалось определить страну", http.StatusInternalServerError)
+		return
+	}
+
 	response := IPResponse{
-		IP: clientIP,
+		IP:      clientIP,
+		Country: country,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
