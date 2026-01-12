@@ -1,44 +1,107 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
-// IPResponse ответ с IP адресом клиента
-type IPResponse struct {
-	IP      string `json:"ip"`
-	Country string `json:"country"`
+var redisClient *redis.Client
+var ctx = context.Background()
+
+func initRedis() {
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379", // или твой Redis сервер
+		Password: "",               // пароль если есть
+		DB:       0,                // номер базы
+	})
+
+	// Проверяем подключение
+	_, err := redisClient.Ping(ctx).Result()
+	if err != nil {
+		log.Printf("⚠️  Redis недоступен: %v (работаем без кэша)", err)
+		redisClient = nil
+	} else {
+		log.Println("✅ Redis подключен")
+	}
 }
 
 type IPInfo struct {
+	IP          string `json:"ip"`
 	Country     string `json:"country"`
 	CountryCode string `json:"countryCode"`
 }
 
-func getCountryByIP(ip string) (string, error) {
-	// метод из сервиса, котрый по ip возвращает страну
-	// Лишь 45 запросов в минуту для бесплатной версии
+func getCountryByIPWithCache(ip string) (string, string, error) {
+	if redisClient == nil {
+		return getCountryByIPDirect(ip)
+	}
+
+	// Пробуем получить как JSON
+	cached, err := redisClient.Get(ctx, "ip:"+ip).Result()
+	if err == nil && cached != "" {
+		var data struct {
+			Country string `json:"country"`
+			Code    string `json:"code"`
+		}
+		if json.Unmarshal([]byte(cached), &data) == nil {
+			return data.Country, data.Code, nil
+		}
+	}
+
+	// Если нет - идем к API
+	log.Printf("Не удалось найти %s в кеше, идем в сервис http://ip-api.com/json/", ip)
+	country, code, err := getCountryByIPDirect(ip)
+	if err != nil {
+		return "", "", err
+	}
+
+	// Сохраняем как JSON
+	data := map[string]string{
+		"country": country,
+		"code":    code,
+	}
+	jsonData, _ := json.Marshal(data)
+	redisClient.Set(ctx, "ip:"+ip, jsonData, 24*time.Hour)
+
+	return country, code, nil
+}
+
+// Старая функция переименовываем
+// Изменяем только getCountryByIPDirect
+func getCountryByIPDirect(ip string) (string, string, error) { // Возвращаем 2 строки
 	url := "http://ip-api.com/json/" + ip
 
 	resp, err := http.Get(url)
-
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer resp.Body.Close()
 
-	var info IPInfo
-
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-		return "", err
+	var result struct {
+		Country     string `json:"country"`
+		CountryCode string `json:"countryCode"`
+		Status      string `json:"status"`
+		Message     string `json:"message"`
 	}
 
-	return info.Country, nil
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", "", err
+	}
+
+	if result.Status != "success" {
+		return "", "", fmt.Errorf("ip-api error: %s", result.Message)
+	}
+
+	return result.Country, result.CountryCode, nil
 }
 
 // getClientIP извлекает реальный IP адрес клиента из запроса
@@ -109,16 +172,18 @@ func ipHandler(w http.ResponseWriter, r *http.Request) {
 		displayIP = clientIP
 	}
 
-	country, err := getCountryByIP(displayIP)
-
+	// Получаем ОБЕ информации
+	country, countryCode, err := getCountryByIPWithCache(displayIP)
 	if err != nil {
-		http.Error(w, "Не удалось определить страну", http.StatusInternalServerError)
-		return
+		log.Printf("⚠️  Ошибка получения страны для %s: %v", displayIP, err)
+		country = ""
+		countryCode = ""
 	}
 
-	response := IPResponse{
-		IP:      displayIP,
-		Country: country,
+	response := IPInfo{
+		IP:          displayIP,
+		Country:     country,
+		CountryCode: countryCode,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -141,6 +206,9 @@ func getServerPublicIP() (string, error) {
 var serverPublicIP string
 
 func main() {
+	log.Println("🚀 Запускаем letta-server...")
+
+	initRedis()
 
 	ip, err := getServerPublicIP()
 	if err == nil {
